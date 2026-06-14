@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -33,6 +34,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 
@@ -72,6 +74,7 @@ def _load_security_config() -> dict:
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_allowed_domains": [],
     }
     try:
         from hermes_cli.config import load_config
@@ -84,6 +87,7 @@ def _load_security_config() -> dict:
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_allowed_domains": cfg.get("tirith_allowed_domains", defaults["tirith_allowed_domains"]),
     }
 
 
@@ -790,19 +794,105 @@ def check_command_security(command: str) -> dict:
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
 
-    # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # the .app TLD.  .app is a legitimate gTLD used by many production services
-    # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Any other finding (including other
-    # lookalike_tld entries for non-.app TLDs) preserves the warn action.
+    # Suppress warn verdicts that consist solely of known false-positive
+    # lookalike_tld findings:
+    # - .app globally, because it is a legitimate gTLD used by many production
+    #   services and the "can be confused with file extensions" heuristic is
+    #   noisy for normal API calls.
+    # - exact configured domains (and their subdomains) in
+    #   security.tirith_allowed_domains, but only when the command includes a
+    #   URL whose host matches that allowlist. This keeps owner-trusted domains
+    #   like runt.run from prompting without globally allowing every .run host.
     if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_app_tld_finding(f)]
+        allowed_domains = cfg.get("tirith_allowed_domains", [])
+        non_suppressible = [
+            f for f in findings
+            if not _is_suppressible_lookalike_tld_finding(f, command, allowed_domains)
+        ]
         if not non_suppressible:
             action = "allow"
             findings = []
             summary = ""
 
     return {"action": action, "findings": findings, "summary": summary}
+
+
+def _is_suppressible_lookalike_tld_finding(
+    finding: dict,
+    command: str,
+    allowed_domains,
+) -> bool:
+    """Return True if a lookalike_tld finding should be suppressed.
+
+    Built-in suppression remains limited to .app. Configured suppression is
+    host-scoped: the command must contain an http(s) URL whose hostname is the
+    configured domain or a subdomain of it.
+    """
+    if _is_app_tld_finding(finding):
+        return True
+    if not isinstance(finding, dict) or finding.get("rule_id") != "lookalike_tld":
+        return False
+    return _command_mentions_allowed_domain_url(command, allowed_domains)
+
+
+def _command_mentions_allowed_domain_url(command: str, allowed_domains) -> bool:
+    normalized_allowed = _normalize_allowed_domains(allowed_domains)
+    if not normalized_allowed:
+        return False
+    for host in _extract_url_hosts(command):
+        if any(_host_matches_allowed_domain(host, domain) for domain in normalized_allowed):
+            return True
+    return False
+
+
+def _normalize_allowed_domains(allowed_domains) -> set[str]:
+    if isinstance(allowed_domains, str):
+        value = allowed_domains.strip()
+        if value.startswith("["):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                raw_domains = [allowed_domains]
+            else:
+                raw_domains = parsed if isinstance(parsed, list) else [allowed_domains]
+        else:
+            raw_domains = [allowed_domains]
+    elif isinstance(allowed_domains, (list, tuple, set)):
+        raw_domains = allowed_domains
+    else:
+        return set()
+
+    normalized = set()
+    for raw in raw_domains:
+        if raw is None:
+            continue
+        domain = str(raw).strip().lower().rstrip(".")
+        if not domain:
+            continue
+        if "://" in domain:
+            domain = (urlparse(domain).hostname or "").lower().rstrip(".")
+        else:
+            domain = domain.split("/", 1)[0]
+            if ":" in domain and not domain.startswith("["):
+                domain = domain.split(":", 1)[0]
+        if domain.startswith("*."):
+            domain = domain[2:]
+        if domain:
+            normalized.add(domain)
+    return normalized
+
+
+def _extract_url_hosts(command: str) -> set[str]:
+    hosts = set()
+    for match in re.finditer(r'https?://[^\s\'"<>`|)]+', command, re.IGNORECASE):
+        parsed = urlparse(match.group(0).rstrip('.,;:'))
+        if parsed.hostname:
+            hosts.add(parsed.hostname.lower().rstrip("."))
+    return hosts
+
+
+def _host_matches_allowed_domain(host: str, allowed_domain: str) -> bool:
+    return host == allowed_domain or host.endswith(f".{allowed_domain}")
 
 
 def _is_app_tld_finding(finding: dict) -> bool:

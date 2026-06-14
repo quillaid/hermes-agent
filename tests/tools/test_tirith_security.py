@@ -1370,6 +1370,55 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
+    def test_configured_lookalike_domain_downgraded_to_allow(self, mock_cfg, mock_run):
+        cfg = dict(_CFG)
+        cfg["tirith_allowed_domains"] = ["runt.run"]
+        mock_cfg.return_value = cfg
+        findings = [{"rule_id": "lookalike_tld", "value": ".run",
+                     "message": "Domain uses '.run' TLD which can be confused with file extensions"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("curl https://img.runt.run/2026/06/06/page.html")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_configured_lookalike_domain_accepts_json_string_from_cli_config_set(self, mock_cfg, mock_run):
+        cfg = dict(_CFG)
+        cfg["tirith_allowed_domains"] = '["runt.run"]'
+        mock_cfg.return_value = cfg
+        findings = [{"rule_id": "lookalike_tld", "value": ".run"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("curl https://img.runt.run/2026/06/06/page.html")
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_configured_lookalike_domain_does_not_suppress_other_domains(self, mock_cfg, mock_run):
+        cfg = dict(_CFG)
+        cfg["tirith_allowed_domains"] = ["runt.run"]
+        mock_cfg.return_value = cfg
+        findings = [{"rule_id": "lookalike_tld", "value": ".run"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("curl https://evil.run")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_configured_lookalike_domain_requires_command_url_match(self, mock_cfg, mock_run):
+        cfg = dict(_CFG)
+        cfg["tirith_allowed_domains"] = ["runt.run"]
+        mock_cfg.return_value = cfg
+        findings = [{"rule_id": "lookalike_tld", "value": ".run"}]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".run TLD warning"))
+        result = check_command_security("echo runt.run")
+        assert result["action"] == "warn"
+        assert len(result["findings"]) == 1
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
     def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
         """block exit code is never downgraded, even if finding looks like .app."""
         mock_cfg.return_value = _CFG
